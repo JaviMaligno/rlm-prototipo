@@ -224,8 +224,10 @@ class RLMOrchestrator:
                             obs += f"[stdout]\n{stdout}\n"
                         if stderr:
                             obs += f"[stderr]\n{stderr}\n"
-                        if not ok and stderr:
-                            obs += "\n[hint] If you got a SyntaxError or complex parsing issue, use llm_query() instead.\n"
+                        if not ok and stderr and "SyntaxError" in stderr:
+                            obs += "\n[hint] SyntaxError: simplify your code. Use llm_query() instead of complex parsing.\n"
+                        elif not ok and "Max subcalls reached" in stderr:
+                            obs += "\n[hint] Max subcalls reached. Synthesize with the data you already have and call final.\n"
                         if not obs:
                             obs = "[no output]"
 
