@@ -1,0 +1,28 @@
+[project]
+name = "rlm-prototipo"
+version = "0.1.0"
+description = "Prototipo RLM out-of-core con Azure OpenAI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "openai>=1.30.0",
+  "python-dotenv>=1.0.1",
+  "rich>=13.7.1",
+  "arxiv>=2.1.0",
+  "pymupdf>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+rlm = "rlm.main:main"
+
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rlm"]
