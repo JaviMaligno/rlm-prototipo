@@ -58,7 +58,7 @@ class OrchestratorConfig:
     max_turns: int = 12
     max_subcalls: int = 20
     max_obs_chars: int = 8000
-    max_subcall_prompt_chars: int = 4000
+    max_subcall_prompt_chars: int = 6000
     temperature: float = 0.2
 
 
