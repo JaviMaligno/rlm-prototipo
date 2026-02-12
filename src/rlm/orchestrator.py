@@ -15,37 +15,41 @@ from .python_env import PythonEnv
 
 
 SYSTEM_PROMPT = """\
-Eres un RLM (Recursive Language Model). El documento completo NO esta en tu contexto.
-El texto esta cargado en un entorno Python persistente como variable `context` (string).
+Eres un RLM (Recursive Language Model). El documento completo NO esta en tu contexto,
+PERO tienes acceso TOTAL a el via codigo Python. Puedes leer cualquier parte del documento
+ejecutando codigo. NUNCA digas que no tienes acceso al documento.
 
 ## Herramientas en el entorno Python
 
-- `context` : str completo del documento
+- `context` : str completo del documento (accesible via python_exec)
 - `get_slice(start, end)` -> str
 - `search(pattern, max_results=5)` -> lista de matches con snippets
 - `llm_query(prompt_text)` -> str   ← SUB-LLAMADA A OTRO LLM (consume 1 subcall)
 
-## Reglas
+## Reglas OBLIGATORIAS
 
-1. **Codigo corto**: Maximo 25 lineas por python_exec. Nada de regex complejas.
-2. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
+1. **SIEMPRE usa herramientas**: Responde SOLO via la herramienta `final`. NUNCA respondas
+   con texto plano. Si quieres responder, llama a `final(answer=...)`.
+2. **Codigo corto**: Maximo 25 lineas por python_exec. Nada de regex complejas.
+3. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
    Ejemplo correcto:
-     summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment[:8000]}")
+     summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment[:6000]}")
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
-3. **Sintetiza**: Agrupa resultados en categorias/temas. No listes elementos uno por uno.
-4. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. Reserva siempre al menos
-   2 subcalls para la sintesis final. NO iteres sobre todas las secciones si son muchas;
-   en su lugar, samplea un subconjunto representativo.
-5. **Llama a final pronto**: Tienes turnos limitados. Cuando tengas suficiente, llama a `final`.
+4. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
+   cifras, conceptos). NUNCA respondas con generalidades vacias como "se propone una nueva
+   arquitectura" sin decir CUAL o QUE hace.
+5. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. Reserva 2 subcalls para la
+   sintesis final. Si hay N secciones y B subcalls, samplea min(N, B-2) distribuidas
+   uniformemente. Usa la mayor parte de tu budget — no te rindas con solo 3-4 subcalls.
+6. **Sintetiza al final**: Agrupa resultados en categorias/temas. No listes uno por uno.
 
 ## Flujo recomendado
 
-1. Explora (turno 1): `len(context)`, cuenta secciones, identifica separadores.
-2. Samplea (turno 1-2): Si hay N secciones y B subcalls disponibles, analiza min(N, B-2)
-   secciones distribuidas uniformemente (ej: cada N//budget secciones).
-3. Sintetiza (ultimo turno): Con las respuestas recopiladas, agrupa por tema/categoria.
-4. Responde: Llama a `final` con la sintesis.
+1. Explora (turno 1): `len(context)`, cuenta secciones, identifica separadores como "===== FILE:".
+2. Samplea (turno 1-2): Analiza multiples secciones distribuidas uniformemente con llm_query().
+3. Sintetiza (turno 2-3): Con las respuestas recopiladas, agrupa por tema/categoria con llm_query().
+4. Responde: Llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
 """
 
 
@@ -356,26 +360,51 @@ class RLMOrchestrator:
                             }
                         )
             else:
+                # No tool calls — the model responded with plain text
+                empty_turns += 1
+
                 if response.content:
                     self._print(
-                        Panel(response.content[:500], title="LLM text response", expand=False)
+                        Panel(response.content[:500], title="LLM text (no tool call)", expand=False)
                     )
-                    return response.content
+                    # Only accept plain text as final answer on the very last turn
+                    # or after repeated failures.  Otherwise nudge back to tools.
+                    if empty_turns >= 3:
+                        self._print("[yellow]3 turns without tool calls, returning text[/yellow]")
+                        return response.content
 
-                # Empty response -- nudge the model to use tools
-                empty_turns += 1
-                if empty_turns >= 3:
-                    self._print("[yellow]3 empty turns, aborting[/yellow]")
-                    return "Model returned empty responses repeatedly."
-                messages.append(
-                    {"role": "assistant", "content": ""},
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Usa la herramienta python_exec para explorar `context` y responde con la herramienta `final`.",
-                    },
-                )
+                    self._print(
+                        "  [yellow]⚠ Model responded with text instead of tools — "
+                        "nudging back to tool use[/yellow]"
+                    )
+                    messages.append(
+                        {"role": "assistant", "content": response.content},
+                    )
+                    remaining_sub = self.config.max_subcalls - self.subcalls
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"NO respondas con texto. Tienes {remaining_sub} subcalls disponibles. "
+                                "Usa python_exec para explorar `context` y luego llama a `final(answer=...)` "
+                                "con datos ESPECIFICOS del documento."
+                            ),
+                        },
+                    )
+                else:
+                    # Truly empty response
+                    if empty_turns >= 3:
+                        self._print("[yellow]3 empty turns, aborting[/yellow]")
+                        return "Model returned empty responses repeatedly."
+                    messages.append(
+                        {"role": "assistant", "content": ""},
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Usa la herramienta python_exec para explorar `context` y responde con la herramienta `final`.",
+                        },
+                    )
 
         total = time.time() - self._run_start
         self._print(
