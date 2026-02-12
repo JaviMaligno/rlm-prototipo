@@ -13,20 +13,32 @@ from .python_env import PythonEnv
 
 SYSTEM_PROMPT = """\
 Eres un RLM (Recursive Language Model). El documento completo NO esta en tu contexto.
-El texto total esta cargado en un entorno Python como variable `context` (string).
-Helpers disponibles en el entorno:
-  - get_slice(start, end) -> str
-  - search(pattern, max_results=5) -> lista de matches con contexto
-  - llm_query(prompt_text) -> str  (sub-consulta a otro LLM sobre un fragmento)
+El texto esta cargado en un entorno Python persistente como variable `context` (string).
 
-Flujo esperado:
-1. Usa python_exec para explorar la estructura del documento (len, search, slicing).
-2. Extrae fragmentos relevantes y usa llm_query() para resumirlos si es necesario.
-3. Sintetiza la informacion y llama a la herramienta `final` con tu respuesta.
+## Herramientas en el entorno Python
 
-IMPORTANTE: Tienes un numero limitado de turnos. No gastes turnos imprimiendo resultados
-que ya tienes en variables. Sintetiza y llama a `final` lo antes posible.
-Cuando tengas suficiente informacion, llama a `final` inmediatamente.
+- `context` : str completo del documento
+- `get_slice(start, end)` -> str
+- `search(pattern, max_results=5)` -> lista de matches con snippets
+- `llm_query(prompt_text)` -> str   ← SUB-LLAMADA A OTRO LLM
+
+## Reglas
+
+1. **Codigo corto**: Maximo 25 lineas por python_exec. Nada de regex complejas.
+2. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
+   Ejemplo correcto:
+     summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment[:8000]}")
+   Ejemplo INCORRECTO:
+     m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
+3. **Sintetiza**: Agrupa resultados en categorias/temas. No listes elementos uno por uno.
+4. **Llama a final pronto**: Tienes turnos limitados. Cuando tengas suficiente, llama a `final`.
+
+## Flujo recomendado
+
+1. Explora: `len(context)`, identifica secciones (busca separadores como "===== FILE:").
+2. Analiza: Itera sobre secciones, llama a `llm_query()` por cada una con un fragmento.
+3. Sintetiza: Agrupa las respuestas por tema/categoria.
+4. Responde: Llama a `final` con la sintesis.
 """
 
 
@@ -178,8 +190,29 @@ class RLMOrchestrator:
 
                     if name == "python_exec":
                         code = args.get("code", "")
+
+                        # Guardrail: reject code that's too long
+                        line_count = code.count("\n") + 1
+                        if line_count > 50:
+                            self.console.print(
+                                f"[yellow]Code too long ({line_count} lines), "
+                                f"rejecting[/yellow]"
+                            )
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.id,
+                                    "content": (
+                                        f"[error] Code too long ({line_count} lines). "
+                                        "Max 50 lines. Simplify: use llm_query() "
+                                        "instead of complex regex or parsing."
+                                    ),
+                                }
+                            )
+                            continue
+
                         self.console.print(
-                            Panel(code[:1000], title="python_exec code", expand=False)
+                            Panel(code[:1500], title=f"python_exec code ({line_count}L)", expand=False)
                         )
                         result = self.env.exec(code)
                         stdout = result.get("stdout", "")
@@ -191,6 +224,8 @@ class RLMOrchestrator:
                             obs += f"[stdout]\n{stdout}\n"
                         if stderr:
                             obs += f"[stderr]\n{stderr}\n"
+                        if not ok and stderr:
+                            obs += "\n[hint] If you got a SyntaxError or complex parsing issue, use llm_query() instead.\n"
                         if not obs:
                             obs = "[no output]"
 
