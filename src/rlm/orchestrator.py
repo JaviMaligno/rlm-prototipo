@@ -75,7 +75,9 @@ class RLMOrchestrator:
         self.client = client
         self.env = env
         self.config = config
-        self.console = console or Console()
+        # Pin Console to the real stdout so prints are visible even inside
+        # PythonEnv.exec() which redirects sys.stdout to a StringIO.
+        self.console = console or Console(file=sys.stdout)
         self.model = model
         self.submodel = submodel
         self.subcalls = 0
@@ -120,8 +122,21 @@ class RLMOrchestrator:
             model=self.submodel or self.model,
             max_tokens=800,
         )
-        dt = time.time() - t0
         answer = response.content or ""
+
+        # Retry once if empty (GPT-5 occasionally returns null content)
+        if not answer and self.subcalls < self.config.max_subcalls:
+            self._print("    [yellow]⟳ empty response, retrying...[/yellow]")
+            response = self.client.chat(
+                messages=messages,
+                tools=None,
+                tool_choice=None,
+                model=self.submodel or self.model,
+                max_tokens=800,
+            )
+            answer = response.content or ""
+
+        dt = time.time() - t0
         self._print(
             f"    [green]✓[/green] [dim]{dt:.1f}s — {len(answer)} chars[/dim]"
         )

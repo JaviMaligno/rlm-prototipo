@@ -36,9 +36,11 @@ class LLMClient:
         kwargs: dict[str, Any] = dict(
             model=model or self.config.deployment_name,
             messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
         )
+        if tools is not None:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
         if temperature is not None:
             kwargs["temperature"] = temperature
         if max_tokens is not None:

@@ -37,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    console = Console()
+    # Pin to real stdout so progress prints remain visible even when
+    # PythonEnv.exec() temporarily redirects sys.stdout.
+    console = Console(file=sys.stdout)
 
     if args.command != "run":
         console.print("Unknown command.")
