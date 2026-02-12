@@ -33,7 +33,7 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
 2. **Codigo corto**: Maximo 25 lineas por python_exec. Nada de regex complejas.
 3. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
    Ejemplo correcto:
-     summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment[:6000]}")
+     summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment}")
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
 4. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
@@ -58,6 +58,7 @@ class OrchestratorConfig:
     max_turns: int = 12
     max_subcalls: int = 20
     max_obs_chars: int = 8000
+    max_subcall_prompt_chars: int = 4000
     temperature: float = 0.2
 
 
@@ -110,7 +111,7 @@ class RLMOrchestrator:
         self.subcalls += 1
 
         # Truncate very long prompts — GPT-5 returns null content on large inputs
-        max_prompt = 6000
+        max_prompt = self.config.max_subcall_prompt_chars
         if len(prompt_text) > max_prompt:
             prompt_text = prompt_text[:max_prompt] + "\n...[truncated]"
 
@@ -130,7 +131,8 @@ class RLMOrchestrator:
         ]
 
         answer = ""
-        for attempt in range(2):
+        max_retries = 4
+        for attempt in range(max_retries):
             response = self.client.chat(
                 messages=messages,
                 tools=None,
@@ -141,8 +143,10 @@ class RLMOrchestrator:
             answer = response.content or ""
             if answer:
                 break
-            if attempt == 0:
-                self._print("    [yellow]⟳ empty, retrying...[/yellow]")
+            if attempt < max_retries - 1:
+                wait = 1.0 * (attempt + 1)
+                self._print(f"    [yellow]⟳ empty, retrying in {wait:.0f}s... (attempt {attempt+1}/{max_retries})[/yellow]")
+                time.sleep(wait)
 
         dt = time.time() - t0
         status = "[green]✓[/green]" if answer else "[yellow]∅[/yellow]"
