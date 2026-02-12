@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 
 from .llm import LLMClient
 from .python_env import PythonEnv
@@ -50,6 +53,15 @@ class OrchestratorConfig:
     temperature: float = 0.2
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as mm:ss or hh:mm:ss."""
+    m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
 class RLMOrchestrator:
     def __init__(
         self,
@@ -67,22 +79,33 @@ class RLMOrchestrator:
         self.model = model
         self.submodel = submodel
         self.subcalls = 0
+        self._run_start: float = 0.0
 
         self.env.set_llm_query(self._llm_query)
+
+    def _print(self, *args: Any, **kwargs: Any) -> None:
+        """Print and immediately flush so output is visible even in piped/background mode."""
+        self.console.print(*args, **kwargs)
+        try:
+            (self.console.file or sys.stdout).flush()
+        except Exception:
+            pass
+
+    def _elapsed(self) -> str:
+        return _fmt_elapsed(time.time() - self._run_start)
 
     def _llm_query(self, prompt_text: str) -> str:
         if self.subcalls >= self.config.max_subcalls:
             raise RuntimeError("Max subcalls reached.")
         self.subcalls += 1
 
-        self.console.print(
-            Panel(
-                f"Subcall #{self.subcalls}\n{prompt_text[:500]}",
-                title="llm_query",
-                expand=False,
-            )
+        self._print(
+            f"  [cyan]⤷ llm_query #{self.subcalls}/{self.config.max_subcalls}[/cyan] "
+            f"[dim]({self._elapsed()})[/dim] "
+            f"[dim]{prompt_text[:120].replace(chr(10), ' ')}...[/dim]"
         )
 
+        t0 = time.time()
         messages = [
             {
                 "role": "system",
@@ -97,7 +120,12 @@ class RLMOrchestrator:
             model=self.submodel or self.model,
             max_tokens=800,
         )
-        return response.content or ""
+        dt = time.time() - t0
+        answer = response.content or ""
+        self._print(
+            f"    [green]✓[/green] [dim]{dt:.1f}s — {len(answer)} chars[/dim]"
+        )
+        return answer
 
     def _tools(self) -> list[dict[str, Any]]:
         return [
@@ -153,6 +181,7 @@ class RLMOrchestrator:
         return serialized
 
     def run(self, question: str) -> str:
+        self._run_start = time.time()
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question},
@@ -161,7 +190,14 @@ class RLMOrchestrator:
         empty_turns = 0
 
         for turn in range(1, self.config.max_turns + 1):
-            self.console.print(Panel(f"Turn {turn}", title="LLM", expand=False))
+            self._print()
+            self._print(Rule(
+                f"[bold]Turn {turn}/{self.config.max_turns}[/bold]  "
+                f"[dim]subcalls={self.subcalls}/{self.config.max_subcalls}  "
+                f"elapsed={self._elapsed()}[/dim]"
+            ))
+
+            t0 = time.time()
             response = self.client.chat(
                 messages=messages,
                 tools=self._tools(),
@@ -169,11 +205,17 @@ class RLMOrchestrator:
                 model=self.model,
                 max_tokens=4096,
             )
+            api_time = time.time() - t0
 
-            self.console.print(
-                f"  [dim]content={bool(response.content)} "
-                f"tool_calls={len(response.tool_calls)}[/dim]"
+            n_tools = len(response.tool_calls)
+            has_content = bool(response.content)
+            self._print(
+                f"  [dim]LLM responded in {api_time:.1f}s — "
+                f"content={has_content} tool_calls={n_tools}[/dim]"
             )
+            if has_content and response.content:
+                preview = response.content[:200].replace("\n", " ")
+                self._print(f"  [dim italic]» {preview}...[/dim italic]")
 
             if response.tool_calls:
                 empty_turns = 0
@@ -194,8 +236,8 @@ class RLMOrchestrator:
                         # Guardrail: reject code that's too long
                         line_count = code.count("\n") + 1
                         if line_count > 50:
-                            self.console.print(
-                                f"[yellow]Code too long ({line_count} lines), "
+                            self._print(
+                                f"  [yellow]⚠ Code too long ({line_count} lines), "
                                 f"rejecting[/yellow]"
                             )
                             messages.append(
@@ -211,13 +253,26 @@ class RLMOrchestrator:
                             )
                             continue
 
-                        self.console.print(
-                            Panel(code[:1500], title=f"python_exec code ({line_count}L)", expand=False)
+                        self._print(
+                            Panel(
+                                code[:1500],
+                                title=f"python_exec ({line_count}L)  [dim]{self._elapsed()}[/dim]",
+                                expand=False,
+                            )
                         )
+
+                        t0 = time.time()
                         result = self.env.exec(code)
+                        exec_time = time.time() - t0
                         stdout = result.get("stdout", "")
                         stderr = result.get("stderr", "")
                         ok = result.get("ok", False)
+
+                        status = "[green]ok[/green]" if ok else "[red]FAIL[/red]"
+                        self._print(
+                            f"  {status} [dim]exec={exec_time:.1f}s  "
+                            f"stdout={len(stdout)}ch  stderr={len(stderr)}ch[/dim]"
+                        )
 
                         obs = ""
                         if stdout:
@@ -237,10 +292,10 @@ class RLMOrchestrator:
                                 + "\n...[truncated]\n"
                             )
 
-                        self.console.print(
+                        self._print(
                             Panel(
                                 obs[:2000],
-                                title=f"python_exec (ok={ok})",
+                                title=f"python_exec result (ok={ok})",
                                 expand=False,
                             )
                         )
@@ -256,6 +311,13 @@ class RLMOrchestrator:
                         answer = args.get("answer", "").strip()
                         if not answer and response.content:
                             answer = response.content.strip()
+                        total = time.time() - self._run_start
+                        self._print()
+                        self._print(Rule("[bold green]Final Answer[/bold green]"))
+                        self._print(
+                            f"  [dim]Completed in {_fmt_elapsed(total)} — "
+                            f"{turn} turns, {self.subcalls} subcalls[/dim]"
+                        )
                         return answer or "[empty answer]"
                     else:
                         messages.append(
@@ -267,7 +329,7 @@ class RLMOrchestrator:
                         )
             else:
                 if response.content:
-                    self.console.print(
+                    self._print(
                         Panel(response.content[:500], title="LLM text response", expand=False)
                     )
                     return response.content
@@ -275,7 +337,7 @@ class RLMOrchestrator:
                 # Empty response -- nudge the model to use tools
                 empty_turns += 1
                 if empty_turns >= 3:
-                    self.console.print("[yellow]3 empty turns, aborting[/yellow]")
+                    self._print("[yellow]3 empty turns, aborting[/yellow]")
                     return "Model returned empty responses repeatedly."
                 messages.append(
                     {"role": "assistant", "content": ""},
@@ -287,4 +349,8 @@ class RLMOrchestrator:
                     },
                 )
 
+        total = time.time() - self._run_start
+        self._print(
+            f"\n[yellow]Max turns reached after {_fmt_elapsed(total)}[/yellow]"
+        )
         return "Max turns reached without final answer."
