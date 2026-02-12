@@ -27,8 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Input file path or glob. Use multiple --input flags.",
     )
     run.add_argument("--question", required=True, help="Question for the RLM")
-    run.add_argument("--max-turns", type=int, default=12)
-    run.add_argument("--max-subcalls", type=int, default=20)
+    run.add_argument("--max-turns", type=int, default=15)
+    run.add_argument("--max-subcalls", type=int, default=90)
     run.add_argument("--max-obs-chars", type=int, default=8000)
     run.add_argument("--max-subcall-prompt-chars", type=int, default=6000,
                      help="Max chars per subcall prompt (truncated if longer)")

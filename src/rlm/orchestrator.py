@@ -55,8 +55,8 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
 
 @dataclass
 class OrchestratorConfig:
-    max_turns: int = 12
-    max_subcalls: int = 20
+    max_turns: int = 15
+    max_subcalls: int = 90
     max_obs_chars: int = 8000
     max_subcall_prompt_chars: int = 6000
     temperature: float = 0.2
