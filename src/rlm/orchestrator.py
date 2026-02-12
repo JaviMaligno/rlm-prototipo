@@ -105,32 +105,28 @@ class RLMOrchestrator:
             raise RuntimeError("Max subcalls reached.")
         self.subcalls += 1
 
+        # Truncate very long prompts — GPT-5 returns null content on large inputs
+        max_prompt = 6000
+        if len(prompt_text) > max_prompt:
+            prompt_text = prompt_text[:max_prompt] + "\n...[truncated]"
+
         self._print(
             f"  [cyan]⤷ llm_query #{self.subcalls}/{self.config.max_subcalls}[/cyan] "
             f"[dim]({self._elapsed()})[/dim] "
-            f"[dim]{prompt_text[:120].replace(chr(10), ' ')}...[/dim]"
+            f"[dim]{len(prompt_text)}ch — {prompt_text[:100].replace(chr(10), ' ')}...[/dim]"
         )
 
         t0 = time.time()
         messages = [
             {
                 "role": "system",
-                "content": "Responde de forma concisa y precisa usando solo el fragmento dado.",
+                "content": "Respond concisely and precisely using only the given fragment.",
             },
             {"role": "user", "content": prompt_text},
         ]
-        response = self.client.chat(
-            messages=messages,
-            tools=None,
-            tool_choice=None,
-            model=self.submodel or self.model,
-            max_tokens=800,
-        )
-        answer = response.content or ""
 
-        # Retry once if empty (GPT-5 occasionally returns null content)
-        if not answer and self.subcalls < self.config.max_subcalls:
-            self._print("    [yellow]⟳ empty response, retrying...[/yellow]")
+        answer = ""
+        for attempt in range(2):
             response = self.client.chat(
                 messages=messages,
                 tools=None,
@@ -139,10 +135,15 @@ class RLMOrchestrator:
                 max_tokens=800,
             )
             answer = response.content or ""
+            if answer:
+                break
+            if attempt == 0:
+                self._print("    [yellow]⟳ empty, retrying...[/yellow]")
 
         dt = time.time() - t0
+        status = "[green]✓[/green]" if answer else "[yellow]∅[/yellow]"
         self._print(
-            f"    [green]✓[/green] [dim]{dt:.1f}s — {len(answer)} chars[/dim]"
+            f"    {status} [dim]{dt:.1f}s — {len(answer)} chars[/dim]"
         )
         return answer
 
