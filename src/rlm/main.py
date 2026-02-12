@@ -56,7 +56,7 @@ def main() -> None:
 
     doc = load_documents(args.input)
     env = PythonEnv()
-    env.set_context(doc.text)
+    env.set_context(doc.text, file_entries=doc.file_entries)
 
     table = Table(title="Document Loaded")
     table.add_column("Sources")
@@ -81,7 +81,11 @@ def main() -> None:
         submodel=config.submodel_name,
     )
 
-    answer = orchestrator.run(args.question)
+    answer = orchestrator.run(
+        args.question,
+        file_entries=doc.file_entries,
+        total_chars=doc.char_len,
+    )
     console.print(Panel(answer, title="Final Answer", expand=False))
 
 

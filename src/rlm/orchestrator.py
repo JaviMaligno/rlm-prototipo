@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .utils import FileEntry
 
 from rich.console import Console
 from rich.panel import Panel
@@ -22,34 +27,48 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
 ## Herramientas en el entorno Python
 
 - `context` : str completo del documento (accesible via python_exec)
+- `context_len` : int con la longitud total del documento
+- `file_count` : int con el numero de archivos cargados
+- `list_files()` -> lista de dicts `{index, name, start, end, size}` con todos los archivos
+- `get_file(i)` -> str con el contenido del archivo i (0-indexed)
 - `get_slice(start, end)` -> str
 - `search(pattern, max_results=5)` -> lista de matches con snippets
 - `llm_query(prompt_text)` -> str   ← SUB-LLAMADA A OTRO LLM (consume 1 subcall)
+- `llm_query_batch(prompts, max_workers=5)` -> list[str]  ← MULTIPLES sub-llamadas EN PARALELO
 
 ## Reglas OBLIGATORIAS
 
 1. **SIEMPRE usa herramientas**: Responde SOLO via la herramienta `final`. NUNCA respondas
    con texto plano. Si quieres responder, llama a `final(answer=...)`.
 2. **Codigo corto**: Maximo 25 lineas por python_exec. Nada de regex complejas.
-3. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
+4. **Usa llm_query() para analizar texto**: No intentes parsear contenido con regex.
    Ejemplo correcto:
      summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment}")
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
-4. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
+5. **Usa llm_query_batch() para multiples analisis**: Cuando necesites analizar varios
+   fragmentos, usa batch en vez de un bucle secuencial de llm_query().
+   Ejemplo correcto:
+     prompts = [f"Resume en 1 frase:\\n{get_file(i)[:6000]}" for i in range(file_count)]
+     results = llm_query_batch(prompts, max_workers=5)
+6. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
    cifras, conceptos). NUNCA respondas con generalidades vacias como "se propone una nueva
    arquitectura" sin decir CUAL o QUE hace.
-5. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. Reserva 2 subcalls para la
-   sintesis final. Si hay N secciones y B subcalls, samplea min(N, B-2) distribuidas
-   uniformemente. Usa la mayor parte de tu budget — no te rindas con solo 3-4 subcalls.
-6. **Sintetiza al final**: Agrupa resultados en categorias/temas. No listes uno por uno.
+7. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. llm_query_batch() gasta
+   len(prompts) subcalls. Reserva 2-3 subcalls para la sintesis final.
+   Usa la mayor parte de tu budget — no te rindas con solo 3-4 subcalls.
+8. **Sintetiza al final**: Agrupa resultados en categorias/temas. No listes uno por uno.
+9. **Separa analisis de respuesta**: Primero usa python_exec para analizar (el ultimo
+   valor de expresion se muestra automaticamente). Luego, en una llamada SEPARADA,
+   usa `final(answer=...)` con esos datos. NO intentes hacer todo en un solo python_exec.
 
 ## Flujo recomendado
 
-1. Explora (turno 1): `len(context)`, cuenta secciones, identifica separadores como "===== FILE:".
-2. Samplea (turno 1-2): Analiza multiples secciones distribuidas uniformemente con llm_query().
-3. Sintetiza (turno 2-3): Con las respuestas recopiladas, agrupa por tema/categoria con llm_query().
-4. Responde: Llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
+1. Lee la tabla de contenidos (ya incluida en tu primer mensaje) para conocer los archivos.
+2. Usa `get_file(i)` para leer archivos individuales. NO parsees separadores manualmente.
+3. Analiza en batch: crea prompts para cada archivo y usa `llm_query_batch(prompts)`.
+4. Sintetiza: agrupa los resultados por tema/categoria con llm_query().
+5. Responde: llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
 """
 
 
@@ -90,9 +109,11 @@ class RLMOrchestrator:
         self.model = model
         self.submodel = submodel
         self.subcalls = 0
+        self._subcall_lock = threading.Lock()
         self._run_start: float = 0.0
 
         self.env.set_llm_query(self._llm_query)
+        self.env.set_llm_query_batch(self._llm_query_batch)
 
     def _print(self, *args: Any, **kwargs: Any) -> None:
         """Print and immediately flush so output is visible even in piped/background mode."""
@@ -106,9 +127,11 @@ class RLMOrchestrator:
         return _fmt_elapsed(time.time() - self._run_start)
 
     def _llm_query(self, prompt_text: str) -> str:
-        if self.subcalls >= self.config.max_subcalls:
-            raise RuntimeError("Max subcalls reached.")
-        self.subcalls += 1
+        with self._subcall_lock:
+            if self.subcalls >= self.config.max_subcalls:
+                raise RuntimeError("Max subcalls reached.")
+            self.subcalls += 1
+            current = self.subcalls
 
         # Truncate very long prompts — GPT-5 returns null content on large inputs
         max_prompt = self.config.max_subcall_prompt_chars
@@ -116,7 +139,7 @@ class RLMOrchestrator:
             prompt_text = prompt_text[:max_prompt] + "\n...[truncated]"
 
         self._print(
-            f"  [cyan]⤷ llm_query #{self.subcalls}/{self.config.max_subcalls}[/cyan] "
+            f"  [cyan]⤷ llm_query #{current}/{self.config.max_subcalls}[/cyan] "
             f"[dim]({self._elapsed()})[/dim] "
             f"[dim]{len(prompt_text)}ch — {prompt_text[:100].replace(chr(10), ' ')}...[/dim]"
         )
@@ -154,6 +177,56 @@ class RLMOrchestrator:
             f"    {status} [dim]{dt:.1f}s — {len(answer)} chars[/dim]"
         )
         return answer
+
+    def _llm_query_batch(self, prompts: list[str], max_workers: int = 5) -> list[str]:
+        needed = len(prompts)
+        with self._subcall_lock:
+            available = self.config.max_subcalls - self.subcalls
+        if needed > available:
+            raise RuntimeError(
+                f"Batch of {needed} prompts exceeds remaining budget ({available} subcalls). "
+                f"Reduce the batch size or use fewer prompts."
+            )
+
+        self._print(
+            f"  [cyan]⤷ llm_query_batch: {needed} prompts, max_workers={max_workers}[/cyan] "
+            f"[dim]({self._elapsed()})[/dim]"
+        )
+
+        results: list[str | None] = [None] * needed
+
+        def _run_one(idx: int, prompt: str) -> tuple[int, str]:
+            try:
+                return idx, self._llm_query(prompt)
+            except Exception as exc:
+                return idx, f"[error: {exc}]"
+
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_run_one, i, p): i for i, p in enumerate(prompts)
+            }
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results[idx] = result
+
+        dt = time.time() - t0
+        ok_count = sum(1 for r in results if r and not r.startswith("[error:"))
+        self._print(
+            f"  [green]✓ batch done[/green] [dim]{dt:.1f}s — "
+            f"{ok_count}/{needed} succeeded[/dim]"
+        )
+        return [r or "[error: no result]" for r in results]
+
+    @staticmethod
+    def _build_toc(file_entries: list[FileEntry], total_chars: int) -> str:
+        lines = [f"## Tabla de Contenidos ({len(file_entries)} archivos, {total_chars:,} chars)\n"]
+        for e in file_entries:
+            name = e.name.rsplit("/", 1)[-1] if "/" in e.name else e.name
+            lines.append(f"  [{e.index}] {name} ({e.size:,} chars)")
+        lines.append("")
+        lines.append("Usa `get_file(i)` para leer el archivo i. Usa `list_files()` para ver detalles.")
+        return "\n".join(lines)
 
     def _tools(self) -> list[dict[str, Any]]:
         return [
@@ -208,11 +281,22 @@ class RLMOrchestrator:
             })
         return serialized
 
-    def run(self, question: str) -> str:
+    def run(
+        self,
+        question: str,
+        file_entries: list[FileEntry] | None = None,
+        total_chars: int = 0,
+    ) -> str:
         self._run_start = time.time()
+
+        user_content = question
+        if file_entries:
+            toc = self._build_toc(file_entries, total_chars)
+            user_content = f"{toc}\n\n---\n\n{question}"
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
+            {"role": "user", "content": user_content},
         ]
 
         empty_turns = 0
@@ -377,24 +461,39 @@ class RLMOrchestrator:
                         self._print("[yellow]3 turns without tool calls, returning text[/yellow]")
                         return response.content
 
-                    self._print(
-                        "  [yellow]⚠ Model responded with text instead of tools — "
-                        "nudging back to tool use[/yellow]"
-                    )
+                    remaining_sub = self.config.max_subcalls - self.subcalls
                     messages.append(
                         {"role": "assistant", "content": response.content},
                     )
-                    remaining_sub = self.config.max_subcalls - self.subcalls
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"NO respondas con texto. Tienes {remaining_sub} subcalls disponibles. "
-                                "Usa python_exec para explorar `context` y luego llama a `final(answer=...)` "
-                                "con datos ESPECIFICOS del documento."
-                            ),
-                        },
-                    )
+                    if remaining_sub == 0:
+                        self._print(
+                            "  [yellow]⚠ Budget exhausted + text response — "
+                            "nudging to call final()[/yellow]"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Budget agotado. Llama AHORA a la herramienta `final(answer=...)` "
+                                    "con los datos que ya tienes. NO uses python_exec."
+                                ),
+                            },
+                        )
+                    else:
+                        self._print(
+                            "  [yellow]⚠ Model responded with text instead of tools — "
+                            "nudging back to tool use[/yellow]"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"NO respondas con texto. Tienes {remaining_sub} subcalls disponibles. "
+                                    "Usa python_exec para explorar `context` y luego llama a `final(answer=...)` "
+                                    "con datos ESPECIFICOS del documento."
+                                ),
+                            },
+                        )
                 else:
                     # Truly empty response
                     if empty_turns >= 3:
