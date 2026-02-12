@@ -138,7 +138,7 @@ class RLMOrchestrator:
                 tools=None,
                 tool_choice=None,
                 model=self.submodel or self.model,
-                max_tokens=800,
+                max_tokens=8000,
             )
             answer = response.content or ""
             if answer:
