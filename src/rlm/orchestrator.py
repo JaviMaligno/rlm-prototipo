@@ -23,7 +23,7 @@ El texto esta cargado en un entorno Python persistente como variable `context` (
 - `context` : str completo del documento
 - `get_slice(start, end)` -> str
 - `search(pattern, max_results=5)` -> lista de matches con snippets
-- `llm_query(prompt_text)` -> str   ← SUB-LLAMADA A OTRO LLM
+- `llm_query(prompt_text)` -> str   ← SUB-LLAMADA A OTRO LLM (consume 1 subcall)
 
 ## Reglas
 
@@ -34,13 +34,17 @@ El texto esta cargado en un entorno Python persistente como variable `context` (
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
 3. **Sintetiza**: Agrupa resultados en categorias/temas. No listes elementos uno por uno.
-4. **Llama a final pronto**: Tienes turnos limitados. Cuando tengas suficiente, llama a `final`.
+4. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. Reserva siempre al menos
+   2 subcalls para la sintesis final. NO iteres sobre todas las secciones si son muchas;
+   en su lugar, samplea un subconjunto representativo.
+5. **Llama a final pronto**: Tienes turnos limitados. Cuando tengas suficiente, llama a `final`.
 
 ## Flujo recomendado
 
-1. Explora: `len(context)`, identifica secciones (busca separadores como "===== FILE:").
-2. Analiza: Itera sobre secciones, llama a `llm_query()` por cada una con un fragmento.
-3. Sintetiza: Agrupa las respuestas por tema/categoria.
+1. Explora (turno 1): `len(context)`, cuenta secciones, identifica separadores.
+2. Samplea (turno 1-2): Si hay N secciones y B subcalls disponibles, analiza min(N, B-2)
+   secciones distribuidas uniformemente (ej: cada N//budget secciones).
+3. Sintetiza (ultimo turno): Con las respuestas recopiladas, agrupa por tema/categoria.
 4. Responde: Llama a `final` con la sintesis.
 """
 
@@ -300,6 +304,14 @@ class RLMOrchestrator:
                             obs += "\n[hint] Max subcalls reached. Synthesize with the data you already have and call final.\n"
                         if not obs:
                             obs = "[no output]"
+
+                        # Inject budget info so the model can plan
+                        remaining_sub = self.config.max_subcalls - self.subcalls
+                        remaining_turns = self.config.max_turns - turn
+                        obs += (
+                            f"\n[budget] subcalls restantes: {remaining_sub}/{self.config.max_subcalls} "
+                            f"| turnos restantes: {remaining_turns}/{self.config.max_turns}\n"
+                        )
 
                         if len(obs) > self.config.max_obs_chars:
                             obs = (
