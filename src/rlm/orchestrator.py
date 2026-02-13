@@ -479,45 +479,29 @@ class RLMOrchestrator:
                     self._print(
                         Panel(response.content[:500], title="LLM text (no tool call)", expand=False)
                     )
-                    # Only accept plain text as final answer on the very last turn
-                    # or after repeated failures.  Otherwise nudge back to tools.
-                    if empty_turns >= 3:
-                        self._print("[yellow]3 turns without tool calls, returning text[/yellow]")
+
+                    # If the model already has data (subcalls > 0), it just
+                    # needs to call final(). Accept text as answer on 2nd
+                    # attempt to avoid wasting turns.
+                    if empty_turns >= 2:
+                        self._print("[yellow]2 text responses — accepting as final answer[/yellow]")
                         return response.content
 
-                    remaining_sub = self.config.max_subcalls - self.subcalls
                     messages.append(
                         {"role": "assistant", "content": response.content},
                     )
-                    if remaining_sub == 0:
-                        self._print(
-                            "  [yellow]⚠ Budget exhausted + text response — "
-                            "nudging to call final()[/yellow]"
-                        )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Budget agotado. Llama AHORA a la herramienta `final(answer=...)` "
-                                    "con los datos que ya tienes. NO uses python_exec."
-                                ),
-                            },
-                        )
-                    else:
-                        self._print(
-                            "  [yellow]⚠ Model responded with text instead of tools — "
-                            "nudging back to tool use[/yellow]"
-                        )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"NO respondas con texto. Tienes {remaining_sub} subcalls disponibles. "
-                                    "Usa python_exec para explorar `context` y luego llama a `final(answer=...)` "
-                                    "con datos ESPECIFICOS del documento."
-                                ),
-                            },
-                        )
+                    self._print(
+                        "  [yellow]⚠ Text response — nudging to call final()[/yellow]"
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "NO respondas con texto. Llama a la herramienta `final(answer=...)` "
+                                "con los datos que ya tienes. NO uses python_exec, solo `final`."
+                            ),
+                        },
+                    )
                 else:
                     # Truly empty response
                     if empty_turns >= 3:
