@@ -46,18 +46,21 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
      summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment}")
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
-5. **Usa llm_query_batch() para multiples analisis**: Cuando necesites analizar varios
-   fragmentos, usa batch en vez de un bucle secuencial de llm_query().
+5. **Usa llm_query_batch() para TODOS los archivos de una vez**: Crea un prompt por archivo
+   y lanza UN SOLO batch con todos. NUNCA hagas llm_query() en un bucle ni multiples batches.
    Ejemplo correcto:
      prompts = [f"Resume en 1 frase:\\n{get_file(i)[:6000]}" for i in range(file_count)]
      results = llm_query_batch(prompts, max_workers=5)
+   Si el batch excede el budget, se ejecutaran los que quepan y el resto se marca [skipped].
 6. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
    cifras, conceptos). NUNCA respondas con generalidades vacias como "se propone una nueva
    arquitectura" sin decir CUAL o QUE hace.
 7. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. llm_query_batch() gasta
-   len(prompts) subcalls. Reserva 2-3 subcalls para la sintesis final.
-   Usa la mayor parte de tu budget — no te rindas con solo 3-4 subcalls.
-8. **Sintetiza al final**: Agrupa resultados en categorias/temas. No listes uno por uno.
+   len(prompts) subcalls. Plan: 1er batch = file_count prompts (usa TODO el budget).
+   La sintesis la haces tu en python_exec sin gastar subcalls.
+8. **Sintetiza TU MISMO**: Despues del batch, los resultados estan en variables Python.
+   Agrupa y sintetiza directamente en python_exec, luego llama `final(answer=...)`.
+   NO uses llm_query() para sintetizar — el prompt seria demasiado largo y se truncaria.
 9. **Separa analisis de respuesta**: Primero usa python_exec para analizar (el ultimo
    valor de expresion se muestra automaticamente). Luego, en una llamada SEPARADA,
    usa `final(answer=...)` con esos datos. NO intentes hacer todo en un solo python_exec.
@@ -65,10 +68,13 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
 ## Flujo recomendado
 
 1. Lee la tabla de contenidos (ya incluida en tu primer mensaje) para conocer los archivos.
-2. Usa `get_file(i)` para leer archivos individuales. NO parsees separadores manualmente.
-3. Analiza en batch: crea prompts para cada archivo y usa `llm_query_batch(prompts)`.
-4. Sintetiza: agrupa los resultados por tema/categoria con llm_query().
-5. Responde: llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
+2. **Cubre TODOS los archivos en UN solo batch**: crea un prompt por archivo y lanza
+   `llm_query_batch(prompts)` con TODOS a la vez. NO hagas multiples batches pequeños ni
+   llm_query() individuales para cada archivo. Con N archivos y B subcalls, tu primer batch
+   debe ser de N prompts (o B-3 si N > B-3, reservando 3 para sintesis).
+3. Sintetiza TU MISMO en python_exec: agrupa los resultados por tema/categoria
+   usando codigo Python (los datos ya estan en variables). NO uses llm_query() para esto.
+4. Responde: llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
 """
 
 
@@ -182,14 +188,25 @@ class RLMOrchestrator:
         needed = len(prompts)
         with self._subcall_lock:
             available = self.config.max_subcalls - self.subcalls
-        if needed > available:
-            raise RuntimeError(
-                f"Batch of {needed} prompts exceeds remaining budget ({available} subcalls). "
-                f"Reduce the batch size or use fewer prompts."
+
+        # Partial execution: process as many as fit in the budget
+        to_run = min(needed, available)
+        skipped = needed - to_run
+
+        if to_run == 0:
+            self._print(
+                f"  [yellow]⚠ llm_query_batch: 0/{needed} — budget exhausted[/yellow]"
+            )
+            return [f"[skipped: budget exhausted]"] * needed
+
+        if skipped > 0:
+            self._print(
+                f"  [yellow]⚠ llm_query_batch: running {to_run}/{needed} "
+                f"(skipping last {skipped} — budget)[/yellow]"
             )
 
         self._print(
-            f"  [cyan]⤷ llm_query_batch: {needed} prompts, max_workers={max_workers}[/cyan] "
+            f"  [cyan]⤷ llm_query_batch: {to_run} prompts, max_workers={max_workers}[/cyan] "
             f"[dim]({self._elapsed()})[/dim]"
         )
 
@@ -204,7 +221,7 @@ class RLMOrchestrator:
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(_run_one, i, p): i for i, p in enumerate(prompts)
+                pool.submit(_run_one, i, p): i for i, p in enumerate(prompts[:to_run])
             }
             for future in as_completed(futures):
                 idx, result = future.result()
@@ -212,9 +229,16 @@ class RLMOrchestrator:
 
         dt = time.time() - t0
         ok_count = sum(1 for r in results if r and not r.startswith("[error:"))
+
+        # Mark skipped prompts
+        for i in range(to_run, needed):
+            results[i] = f"[skipped: budget exhausted (index {i})]"
+
         self._print(
             f"  [green]✓ batch done[/green] [dim]{dt:.1f}s — "
-            f"{ok_count}/{needed} succeeded[/dim]"
+            f"{ok_count}/{to_run} succeeded"
+            + (f", {skipped} skipped" if skipped else "")
+            + "[/dim]"
         )
         return [r or "[error: no result]" for r in results]
 
