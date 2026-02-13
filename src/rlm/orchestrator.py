@@ -46,35 +46,54 @@ ejecutando codigo. NUNCA digas que no tienes acceso al documento.
      summary = llm_query(f"Resume en 1 frase la contribucion principal:\\n{fragment}")
    Ejemplo INCORRECTO:
      m = re.search(r"(?:we propose|this paper)...", text)  # NO hagas esto
-5. **Usa llm_query_batch() para TODOS los archivos de una vez**: Crea un prompt por archivo
-   y lanza UN SOLO batch con todos. NUNCA hagas llm_query() en un bucle ni multiples batches.
-   Ejemplo correcto:
-     prompts = [f"Resume en 1 frase:\\n{get_file(i)[:6000]}" for i in range(file_count)]
-     results = llm_query_batch(prompts, max_workers=5)
-   Si el batch excede el budget, se ejecutaran los que quepan y el resto se marca [skipped].
+5. **Elige la estrategia segun la pregunta** (ver Flujo A vs Flujo B abajo):
+   - Pregunta AMPLIA (afecta a muchos/todos los archivos) → Flujo A: batch de TODOS.
+   - Pregunta ESPECIFICA (sobre 1-3 archivos concretos) → Flujo B: leer completos + queries focalizadas.
 6. **Se ESPECIFICO**: Tus respuestas deben contener datos concretos del documento (nombres,
    cifras, conceptos). NUNCA respondas con generalidades vacias como "se propone una nueva
    arquitectura" sin decir CUAL o QUE hace.
 7. **Gestiona tu budget**: Cada llm_query() gasta 1 subcall. llm_query_batch() gasta
-   len(prompts) subcalls. Plan: 1er batch = file_count prompts (usa TODO el budget).
-   La sintesis la haces tu en python_exec sin gastar subcalls.
-8. **Sintetiza TU MISMO**: Despues del batch, los resultados estan en variables Python.
-   Agrupa y sintetiza directamente en python_exec, luego llama `final(answer=...)`.
-   NO uses llm_query() para sintetizar — el prompt seria demasiado largo y se truncaria.
+   len(prompts) subcalls. Planifica segun el flujo elegido.
+8. **Sintetiza TU MISMO**: Despues de recopilar datos, agrupa y sintetiza directamente en
+   python_exec, luego llama `final(answer=...)`. NO uses llm_query() para sintetizar.
 9. **Separa analisis de respuesta**: Primero usa python_exec para analizar (el ultimo
    valor de expresion se muestra automaticamente). Luego, en una llamada SEPARADA,
    usa `final(answer=...)` con esos datos. NO intentes hacer todo en un solo python_exec.
+10. **NO desperdicies turnos**: Tienes un máximo de turnos. Despues de tus subcalls,
+    sintetiza en 1-2 python_exec y llama `final()` INMEDIATAMENTE. NO hagas búsquedas
+    adicionales con search() ni más subcalls para "mejorar" la respuesta. Usa los datos
+    que ya tienes. Es MEJOR una respuesta buena en pocos turnos que una perfecta que
+    agota los turnos y necesita grace turn.
 
-## Flujo recomendado
+## Flujo A — Pregunta AMPLIA (afecta a muchos archivos)
+
+Usa este flujo cuando la pregunta pide resumir, comparar o categorizar TODOS o MUCHOS archivos.
 
 1. Lee la tabla de contenidos (ya incluida en tu primer mensaje) para conocer los archivos.
 2. **Cubre TODOS los archivos en UN solo batch**: crea un prompt por archivo y lanza
    `llm_query_batch(prompts)` con TODOS a la vez. NO hagas multiples batches pequeños ni
-   llm_query() individuales para cada archivo. Con N archivos y B subcalls, tu primer batch
-   debe ser de N prompts (o B-3 si N > B-3, reservando 3 para sintesis).
+   llm_query() individuales. Con N archivos y B subcalls, tu primer batch debe ser de N prompts.
+   Si el batch excede el budget, se ejecutaran los que quepan y el resto se marca [skipped].
 3. Sintetiza TU MISMO en python_exec: agrupa los resultados por tema/categoria
    usando codigo Python (los datos ya estan en variables). NO uses llm_query() para esto.
 4. Responde: llama a `final(answer=...)` con la sintesis. NUNCA respondas sin usar `final`.
+
+## Flujo B — Pregunta ESPECIFICA (sobre 1-3 archivos concretos)
+
+Usa este flujo cuando la pregunta menciona un paper/archivo concreto o un tema muy especifico
+que solo afecta a pocos archivos.
+
+1. Lee la tabla de contenidos e identifica los archivos relevantes por nombre.
+2. **Lee el contenido COMPLETO** de esos archivos con `get_file(i)` (sin truncar).
+3. **Divide el contenido en secciones** y usa `llm_query()` o `llm_query_batch()` con
+   fragmentos grandes para extraer los datos exactos que pide la pregunta. Puedes enviar
+   hasta ~30000 caracteres por subcall. Ejemplo para un paper largo:
+     text = get_file(4)
+     chunks = [text[i:i+30000] for i in range(0, len(text), 25000)]  # overlap 5000
+     prompts = [f"Extrae los 14 tipos de ataques con nombres exactos:\\n{c}" for c in chunks]
+     results = llm_query_batch(prompts)
+4. Sintetiza TU MISMO en python_exec combinando los resultados de cada fragmento.
+5. Responde: llama a `final(answer=...)`. NUNCA respondas sin usar `final`.
 """
 
 
@@ -83,7 +102,7 @@ class OrchestratorConfig:
     max_turns: int = 15
     max_subcalls: int = 90
     max_obs_chars: int = 8000
-    max_subcall_prompt_chars: int = 6000
+    max_subcall_prompt_chars: int = 32000
     temperature: float = 0.2
 
 
@@ -324,6 +343,8 @@ class RLMOrchestrator:
         ]
 
         empty_turns = 0
+        turns_since_last_subcall = 0   # counts turns with no new subcalls
+        last_subcall_snapshot = 0       # subcall count at last check
 
         for turn in range(1, self.config.max_turns + 1):
             self._print()
@@ -339,7 +360,7 @@ class RLMOrchestrator:
                 tools=self._tools(),
                 tool_choice="auto",
                 model=self.model,
-                max_tokens=4096,
+                max_tokens=16384,
             )
             api_time = time.time() - t0
 
@@ -471,6 +492,33 @@ class RLMOrchestrator:
                                 "content": f"[error] Unknown tool: {name}",
                             }
                         )
+
+                # Track turns without new subcalls → nudge to call final()
+                if self.subcalls > 0:
+                    if self.subcalls == last_subcall_snapshot:
+                        turns_since_last_subcall += 1
+                    else:
+                        turns_since_last_subcall = 0
+                        last_subcall_snapshot = self.subcalls
+
+                    if turns_since_last_subcall >= 3:
+                        self._print(
+                            "  [yellow]⚠ 3 turns without new subcalls — "
+                            "nudging to call final()[/yellow]"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "PARA. Ya tienes suficientes datos. NO hagas más búsquedas, "
+                                    "NO hagas más subcalls, NO uses search(). "
+                                    "Sintetiza lo que tienes en UN python_exec y llama `final(answer=...)` "
+                                    "EN EL SIGUIENTE turno. Es mejor una respuesta buena ahora que "
+                                    "una perfecta que agota los turnos."
+                                ),
+                            },
+                        )
+                        turns_since_last_subcall = 0  # reset to avoid spamming
             else:
                 # No tool calls — the model responded with plain text
                 empty_turns += 1

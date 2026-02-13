@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-turns", type=int, default=15)
     run.add_argument("--max-subcalls", type=int, default=90)
     run.add_argument("--max-obs-chars", type=int, default=8000)
-    run.add_argument("--max-subcall-prompt-chars", type=int, default=6000,
+    run.add_argument("--max-subcall-prompt-chars", type=int, default=32000,
                      help="Max chars per subcall prompt (truncated if longer)")
     run.add_argument("--temperature", type=float, default=0.2)
     return parser
