@@ -533,8 +533,50 @@ class RLMOrchestrator:
                         },
                     )
 
+        # Grace turn: force the model to call final() with whatever data it has
+        self._print()
+        self._print(Rule(
+            "[bold yellow]Grace turn[/bold yellow]  "
+            "[dim]forcing final() after max turns[/dim]"
+        ))
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Se acabaron los turnos. Llama AHORA a `final(answer=...)` con TODA la "
+                    "información que hayas recopilado. Es tu ULTIMA oportunidad."
+                ),
+            },
+        )
+        final_only = [t for t in self._tools() if t["function"]["name"] == "final"]
+        response = self.client.chat(
+            messages=messages,
+            tools=final_only,
+            tool_choice={"type": "function", "function": {"name": "final"}},
+            model=self.model,
+            max_tokens=16384,
+        )
+        if response.tool_calls:
+            for call in response.tool_calls:
+                if call.function.name == "final":
+                    args = json.loads(call.function.arguments or "{}")
+                    answer = args.get("answer", "").strip()
+                    if not answer and response.content:
+                        answer = response.content.strip()
+                    total = time.time() - self._run_start
+                    self._print()
+                    self._print(Rule("[bold green]Final Answer (grace)[/bold green]"))
+                    self._print(
+                        f"  [dim]Completed in {_fmt_elapsed(total)} — "
+                        f"{self.config.max_turns}+1 turns, {self.subcalls} subcalls[/dim]"
+                    )
+                    return answer or "[empty answer]"
+
         total = time.time() - self._run_start
         self._print(
             f"\n[yellow]Max turns reached after {_fmt_elapsed(total)}[/yellow]"
         )
+        # Last resort: return any text the model provided
+        if response.content:
+            return response.content.strip()
         return "Max turns reached without final answer."
